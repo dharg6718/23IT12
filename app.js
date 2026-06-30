@@ -18,12 +18,6 @@ const typeWeights = {
   Event: 1
 };
 
-const cache = {
-  data: null,
-  updatedAt: 0,
-  ttlMs: 15 * 1000
-};
-
 function normalizeNotifications(payload) {
   if (!payload) {
     return [];
@@ -77,6 +71,18 @@ const tokenCache = {
   expiresAt: 0
 };
 
+function buildAuthorizationHeader(req) {
+  const authHeaderValue = req.headers.authorization;
+  const tokenParam = req.query.token || req.query.auth;
+  const headerValue = authHeaderValue || tokenParam || authHeader || '';
+  if (!headerValue) {
+    return null;
+  }
+
+  const normalized = headerValue.toString().trim();
+  return /^Bearer\s+/i.test(normalized) ? normalized : `Bearer ${normalized}`;
+}
+
 async function fetchAccessToken() {
   if (tokenCache.token && Date.now() < tokenCache.expiresAt - 5000) {
     return tokenCache.token;
@@ -108,31 +114,22 @@ async function fetchAccessToken() {
   return tokenCache.token;
 }
 
-async function fetchNotifications() {
-  const now = Date.now();
-  if (cache.data && now - cache.updatedAt < cache.ttlMs) {
-    return { source: 'cache', data: cache.data };
+async function fetchNotifications(headers = {}) {
+  if (!headers.Authorization) {
+    if (tokenUrl && clientId && clientSecret) {
+      const token = await fetchAccessToken();
+      headers.Authorization = `Bearer ${token}`;
+    }
   }
 
-  const headers = {};
-  if (authHeader) {
-    const normalized = authHeader.trim();
-    if (/^Bearer\s+/i.test(normalized)) {
-      headers.Authorization = normalized;
-    } else {
-      headers.Authorization = `Bearer ${normalized}`;
-    }
-  } else if (tokenUrl && clientId && clientSecret) {
-    const token = await fetchAccessToken();
-    headers.Authorization = `Bearer ${token}`;
+  if (!headers.Authorization) {
+    throw new Error('Authorization header is required to fetch notifications');
   }
 
   const response = await axios.get(notificationApiUrl, { headers, timeout: 10000 });
   const notifications = normalizeNotifications(response.data);
-  cache.data = notifications;
-  cache.updatedAt = Date.now();
 
-  return { source: 'remote', data: notifications };
+  return { source: 'remote', data: notifications, raw: response.data };
 }
 
 app.get('/health', (req, res) => {
@@ -141,11 +138,17 @@ app.get('/health', (req, res) => {
 
 app.get('/notifications', async (req, res) => {
   try {
-    const result = await fetchNotifications();
-    res.json({ source: result.source, count: result.data.length, notifications: result.data });
+    const authHeaderValue = buildAuthorizationHeader(req);
+    if (!authHeaderValue) {
+      return res.status(401).json({ error: 'Authorization required', detail: 'Provide ?token=<bearer-token> or Authorization header' });
+    }
+
+    const result = await fetchNotifications({ Authorization: authHeaderValue });
+    res.json({ source: result.source, count: result.data.length, notifications: result.data, raw: result.raw });
   } catch (error) {
-    const message = error.response?.data || error.message || 'Failed to fetch notifications';
-    res.status(502).json({ error: 'Unable to retrieve notifications', detail: message });
+      const status = error.response?.status || 502;
+      const message = error.response?.data || error.message || 'Failed to fetch notifications';
+      res.status(status).json({ error: 'Unable to retrieve notifications', detail: message });
   }
 });
 
@@ -153,18 +156,72 @@ app.get('/priority-notifications', async (req, res) => {
   const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 10));
 
   try {
-    const result = await fetchNotifications();
+    const authHeaderValue = buildAuthorizationHeader(req);
+    if (!authHeaderValue) {
+      return res.status(401).json({ error: 'Authorization required', detail: 'Provide ?token=<bearer-token> or Authorization header' });
+    }
+
+    const result = await fetchNotifications({ Authorization: authHeaderValue });
     const sorted = sortNotifications(result.data).slice(0, limit);
     res.json({
       source: result.source,
       limit,
       count: sorted.length,
-      notifications: sorted
+      notifications: sorted,
+      raw: result.raw
     });
   } catch (error) {
-    const message = error.response?.data || error.message || 'Failed to fetch notifications';
-    res.status(502).json({ error: 'Unable to retrieve priority notifications', detail: message });
+      const status = error.response?.status || 502;
+      const message = error.response?.data || error.message || 'Failed to fetch notifications';
+      res.status(status).json({ error: 'Unable to retrieve priority notifications', detail: message });
   }
+});
+
+app.get('/raw-notifications', async (req, res) => {
+  try {
+    const authHeaderValue = buildAuthorizationHeader(req);
+    if (!authHeaderValue) {
+      return res.status(401).json({ error: 'Authorization required', detail: 'Provide ?token=<bearer-token> or Authorization header' });
+    }
+
+    const result = await axios.get(notificationApiUrl, {
+      headers: { Authorization: authHeaderValue },
+      timeout: 10000
+    });
+
+    res.status(result.status).json(result.data);
+  } catch (error) {
+      const status = error.response?.status || 502;
+      const message = error.response?.data || error.message || 'Failed to fetch raw notifications';
+      res.status(status).json({ error: 'Unable to retrieve raw notifications', detail: message });
+  }
+});
+
+
+app.get('/mock-notifications', (req, res) => {
+  const sample = {
+    notifications: [
+      {
+        ID: 'd146095a-0d86-4a34-9e69-3900a14576bc',
+        Type: 'Result',
+        Message: 'mid-sem',
+        Timestamp: '2026-04-22 17:51:30'
+      },
+      {
+        ID: 'b283218f-ea5a-4b7c-93a9-1f2f240d64b0',
+        Type: 'Placement',
+        Message: 'CSX Corporation hiring',
+        Timestamp: '2026-04-22 17:51:18'
+      },
+      {
+        ID: '81589ada-0ad3-4f77-9554-f52fb558e09d',
+        Type: 'Event',
+        Message: 'farewell',
+        Timestamp: '2026-04-22 17:51:06'
+      }
+    ]
+  };
+  res.json(sample);
 });
 
 app.listen(port, () => {
